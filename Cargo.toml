@@ -1,0 +1,15 @@
+[package]
+name = "async-playground"
+version = "0.1.0"
+authors = ["Scott Macfarlane <smacfarlane@chef.io>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio = {version = "*", features = [ "rt-threaded", "macros"]}
+actix = "*"
+rand = "*"
+tracing = "*"
+tracing-subscriber = "*"
+tracing-futures = "*"
