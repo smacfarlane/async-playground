@@ -12,8 +12,25 @@ struct Datastore {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
+enum TaskState {
+  Queued,
+  // Ready,
+  // Dispatched,
+  // Complete
+}
+
+#[derive(Debug)]
+#[non_exhaustive]
+enum TaskMsg {
+  TaskArrival,
+}
+
+#[derive(Debug)]
 struct Task {
-  pub name: String
+  pub name: String,
+  subtasks: Vec<u32>,
+  state: TaskState,
 }
 
 impl Task {
@@ -23,8 +40,13 @@ impl Task {
         .sample_iter(&rand::distributions::Alphanumeric)
         .take(10)
         .collect();
+    let subtask_count = thread_rng().gen_range(1, 10);
+    let subtasks: Vec<u32> = thread_rng().sample_iter(&rand::distributions::Standard)
+      .take(subtask_count)
+      .map(|n:u32| n % 15)
+      .collect();
     debug!("Created task {}", &name);
-    Task { name }
+    Task { name, subtasks, state: TaskState::Queued }
   }
 }
 
@@ -93,8 +115,21 @@ impl DatastoreManager {
   }
 }
 
+#[non_exhaustive]
+enum WorkerMsg {
+  // Dispatch{ task: Task, resp: Responder<()> }
+}
+
+// struct WorkerMgr {
+  // worker_rx: mpsc::Receiver<WorkerMsg>,
+// }
+//
+// impl WorkerMgr {
+  // pub fn new() ->
+// }
+
 #[tracing::instrument]
-async fn generate_tasks(mut ds_tx: mpsc::Sender<DatastoreMsg>) -> JoinHandle<()> {
+async fn generate_tasks(mut ds_tx: mpsc::Sender<DatastoreMsg>, mut task_tx: mpsc::Sender<TaskMsg>) -> JoinHandle<()> {
   tokio::task::spawn(async move {
       let mut timer = interval(std::time::Duration::from_secs(1));
 
@@ -105,6 +140,15 @@ async fn generate_tasks(mut ds_tx: mpsc::Sender<DatastoreMsg>) -> JoinHandle<()>
         let (resp_tx, resp_rx) = oneshot::channel();
         let msg = DatastoreMsg::NewTask{task, resp: resp_tx};
         let _ = ds_tx.send(msg).await;
+        
+        // For fun, lets not care about a response
+        // Also, sometimes forget to send so the "true up timer" has some work
+        if thread_rng().gen_range(0,10) > 3 {
+          let _ = task_tx.send(TaskMsg::TaskArrival).await;
+        } else { 
+          info!("Skipping dispatch");
+        }
+
         match resp_rx.await {
           Ok(_) => debug!("Submitted task successfully"),
           Err(e) => debug!("Unable to submit task: {}", e),
@@ -137,34 +181,100 @@ async fn gather_metrics(mut ds_tx: mpsc::Sender<DatastoreMsg>) -> JoinHandle<()>
   })
 }
 
+#[allow(dead_code)]
+#[derive(Debug)]
 struct Scheduler {
   datastore_tx: mpsc::Sender<DatastoreMsg>,
-
+  task_rx: mpsc::Receiver<TaskMsg>,
+  workermgr_tx: mpsc::Sender<WorkerMsg>,
 }
 
+impl Scheduler {
+  #[tracing::instrument]
+  pub fn new(datastore_tx: mpsc::Sender<DatastoreMsg>, task_rx: mpsc::Receiver<TaskMsg>, workermgr_tx: mpsc::Sender<WorkerMsg>) -> Scheduler {
+    Scheduler { 
+      datastore_tx,
+      task_rx,
+      workermgr_tx,
+    }
+  }
 
-async fn schedule_work(ds_tx: mpsc::Sender<DatastoreMsg>) -> JoinHandle {
-  
+  pub async fn run(&mut self) -> JoinHandle<()> {
+      let mut timer = interval(std::time::Duration::from_secs(10));
+      loop {
+        tokio::select! {
+          _ = timer.tick() => {
+            info!("Tick! Waking up to schedule lost tasks");
+            
+            let (tx,rx) = oneshot::channel();
+            let _ = self.datastore_tx.send(DatastoreMsg::TaskCount{resp: tx}).await;
 
+            match rx.await.unwrap() {
+              Ok(count) => info!("{} Tasks queued", count),
+              Err(e) => info!("Error fetching tasks {:?}", e)
+            };
+            if let Some(task) = self.get_next_task().await {
+              // Awaiting here seems possibly problematic
+              self.dispatch_task(task).await;
+            }
+
+          },
+          _msg = self.task_rx.recv() => {
+            info!("Task Arrived");
+            if let Some(task) = self.get_next_task().await {
+              self.dispatch_task(task).await;
+            }
+          }
+          //handle message from worker
+        }
+      }
+  }
+
+  #[tracing::instrument(level= "debug")]
+  async fn get_next_task(&mut self) -> Option<Task> {  
+      let (tx,rx) = oneshot::channel();
+      let _ = self.datastore_tx.send(DatastoreMsg::GetTask{resp: tx}).await;
+
+      match rx.await.unwrap() {
+        Ok(Some(task)) => { info!("Got task: {:?}", &task); Some(task) },
+        Ok(None) => { debug!("No tasks recieved"); None },
+        Err(e) => { info!("No task recieved; {:?}", e); None }
+      }
+  }
+
+  #[tracing::instrument(level= "debug")]
+  async fn dispatch_task(&self, task: Task) {
+      // let (tx,rx) = oneshot::channel();
+      // self.worker_mgr.send(DatastoreMsg::GetTask{resp: tx}).await;
+    info!("Placehoder dispatch");
+  }
 }
 
+async fn schedule_work(mut scheduler: Scheduler) -> JoinHandle<()> {
+  tokio::task::spawn( async move {
+    scheduler.run().await;
+  })
+}
 
 #[tokio::main]
 async fn main() {
   tracing_subscriber::fmt::init();
 
-  let (tx, rx) = mpsc::channel(100);
-  let taskgen_handle = generate_tasks(tx.clone());
-  let metrics_handle = gather_metrics(tx.clone());
+  let (ds_tx, ds_rx) = mpsc::channel(100);
+  let (task_tx, task_rx) = mpsc::channel(100);
+  let (workermgr_tx, _workermgr_rx) = mpsc::channel(100);
+  let taskgen_handle = generate_tasks(ds_tx.clone(), task_tx.clone());
+  let metrics_handle = gather_metrics(ds_tx.clone());
 
   let mut dsm = DatastoreManager::new();
   info!("Starting datastore");
-  let ds = dsm.run(rx);
+  let ds = dsm.run(ds_rx);
   info!("Starting Scheduler");
-
+  let scheduler = Scheduler::new(ds_tx.clone(), task_rx, workermgr_tx.clone());
 
   taskgen_handle.await;
   metrics_handle.await;
+  schedule_work(scheduler).await;
   ds.await;
   
 }
